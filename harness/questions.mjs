@@ -138,9 +138,17 @@ export function isListRequest(text) {
  * message each. Only ONE ask is tracked at a time: a second one while the first
  * is open is handed straight back to the host (`next()`), because interleaving
  * two question sets over a single chat would misroute the replies.
+ *
+ * `shouldPush(request)` is the valve. R3/A5 draw the line at the conversation's
+ * switch: a conversation whose switch is OFF does not talk to WeChat, and that
+ * covers a question's text and options exactly as it covers a finished turn.
+ * Returning false hands the ask straight to the host, so the Web/CLI surfaces
+ * answer it and WeChat stays silent. Absent valve = always push, which keeps
+ * the bridge usable on its own (the host shell supplies the real one).
  */
 export function createQuestionBridge({
   send,                       // (text) => Promise<unknown>, the outbound channel
+  shouldPush = () => true,    // (request) => boolean|Promise<boolean>, the R3/A5 valve
   log = console,
   timeoutMs = 10 * 60 * 1000,
   now = () => Date.now(),
@@ -175,13 +183,29 @@ export function createQuestionBridge({
     pendingCount: () => (current ? 1 : 0),
 
     /** The `user-questions/request` waterfall handler. */
-    handle(request, next) {
+    async handle(request, next) {
       if (typeof next !== 'function') throw new TypeError('question waterfall handler requires next');
       if (current) return next();                     // never interleave two asks
 
       const questions = (Array.isArray(request?.questions) ? request.questions : [])
         .filter(validHarnessQuestion);
       if (questions.length === 0) return next();
+
+      // The valve is checked BEFORE anything is tracked or sent. A question for
+      // a conversation whose switch is OFF is not ours to answer: hand it to the
+      // host untouched. This must not create a pending either -- a pending with
+      // nothing pushed to WeChat would swallow the user's next real message as
+      // an answer to a question they never saw.
+      let wanted = false;
+      try {
+        wanted = (await shouldPush(request, questions)) !== false;
+      } catch (error) {
+        // A valve that throws must not decide in favour of sending: staying
+        // silent is the safe failure, and the host still has its own surfaces.
+        log.warn?.(`[wechat-box] the question gate failed, leaving this ask to the host: ${error?.message ?? error}`);
+        wanted = false;
+      }
+      if (!wanted) return next();
 
       const signal = request?.signal;
       if (signal?.aborted) {

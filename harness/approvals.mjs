@@ -42,8 +42,14 @@ export function approvalText({ toolName, reason } = {}) {
   return lines.join('\n');
 }
 
+/**
+ * `shouldPush(request)` is the R3/A5 valve, exactly as in the question bridge:
+ * an approval for a conversation whose switch is OFF is not pushed to WeChat,
+ * and is handed to the host instead. Absent valve = always push.
+ */
 export function createApprovalBridge({
   send,                       // (text) => Promise<unknown>
+  shouldPush = () => true,    // (request) => boolean|Promise<boolean>
   log = console,
   timeoutMs = 10 * 60 * 1000,
 } = {}) {
@@ -73,9 +79,21 @@ export function createApprovalBridge({
     pendingCount: () => (current ? 1 : 0),
 
     /** The `approval/request` waterfall handler. */
-    handle(request, next) {
+    async handle(request, next) {
       if (typeof next !== 'function') throw new TypeError('approval waterfall handler requires next');
       if (current) return next();                  // never two approvals at once
+
+      // Checked before anything is tracked or sent, for the same reason as the
+      // question bridge: a pending with nothing pushed to WeChat would eat the
+      // user's next message as an answer to a prompt they never saw.
+      let wanted = false;
+      try {
+        wanted = (await shouldPush(request)) !== false;
+      } catch (error) {
+        log.warn?.(`[wechat-box] the approval gate failed, leaving this approval to the host: ${error?.message ?? error}`);
+        wanted = false;
+      }
+      if (!wanted) return next();
 
       const signal = request?.signal;
       if (signal?.aborted) return Promise.reject(unavailable('the approval was aborted before it was asked'));
