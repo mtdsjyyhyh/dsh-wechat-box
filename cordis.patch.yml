@@ -1,0 +1,15 @@
+# Bundle layer for dsh-wechat-box: one host entry, mounted by the profile that
+# lists this package in dsh.profile.bundles.
+#
+# weixinEnabled:
+#   false -- the host half loads, the web switch renders, the harness bridge
+#            observes turns, but the WeChat transport does NOT connect. Safe
+#            while @xmanrui/dsh-im is still long-polling the same bot.
+#   true  -- takes over WeChat. Only ONE consumer may poll a bot, so turn this
+#            on in the same restart that removes dsh-im from the profile.
+- insert:
+    - id: dsh-wechat-box
+      name: 'dsh-wechat-box'
+      config:
+        weixinEnabled: false
+

@@ -1,0 +1,31 @@
+# Normalise line endings in the repository, independent of the cloner's
+# core.autocrlf setting.
+#
+# Why this file exists: this machine has the Git for Windows default
+# `core.autocrlf=true`, which silently rewrote the working tree of every text
+# file during the first `git add` (files nobody intended to touch). Declaring
+# the rules here makes the same commit reproducible on any machine.
+#
+# `eol=lf` (not `text=auto`) is deliberate for the PowerShell scripts:
+# install.ps1 / migrate.ps1 / verify.ps1 / test-migrate.ps1 are checked out as
+# LF on every platform so their bytes are identical everywhere. That matters
+# because PowerShell 5.1 decides how to decode a BOM-less .ps1 from its
+# content and the console code page -- the scripts are kept pure ASCII so this
+# is safe, and pinning the bytes keeps it that way.
+* text=auto eol=lf
+
+*.ps1   text eol=lf
+*.mjs   text eol=lf
+*.js    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.md    text eol=lf
+
+# Never touch binary content.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.zip   binary
+*.exe   binary

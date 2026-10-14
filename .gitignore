@@ -1,0 +1,41 @@
+# --- dependencies -----------------------------------------------------------
+node_modules/
+.pnpm-store/
+
+# --- machine-local backups: CONFIG SNAPSHOTS + ACCOUNT STATE ----------------
+# _baseline/ holds profile package.json copies, cordis patches and the archived
+# WeChat account state (a full conversation dump). It must never be committed.
+_baseline/
+
+# Reconnaissance scratch used while reverse-engineering the host and the
+# WeChat iLink protocol: dumps of app.asar internals, cookies, probes.
+_recon/
+
+# --- runtime state ----------------------------------------------------------
+# The plugin writes JSON state under <DSH_HOME>/storages/, but a copy can end
+# up beside the repo while debugging. None of it belongs in git.
+storages/
+*.json.tmp
+
+# --- logs and diagnostics ---------------------------------------------------
+*.log
+logs/
+crash-*.host.log
+
+# --- credentials ------------------------------------------------------------
+# Never commit a token, credential store or account file.
+.credentials.yaml
+.credentials.yml
+.env
+.env.*
+*account*.json
+!package.json
+
+# --- editors / OS -----------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
