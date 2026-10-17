@@ -16,8 +16,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { createDecipheriv, createHash } from 'node:crypto';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
@@ -88,6 +88,38 @@ function jsonResponse(body, status = 200) {
   };
 }
 
+/** 二进制上传的响应体为空，只需要一个 2xx。 */
+function emptyResponse(status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => null },
+    async json() { return {}; },
+    async text() { return ''; },
+  };
+}
+
+/** CDN 上传的回执在响应头里（x-encrypted-param），body 是空的。 */
+function headerResponse(status, headers) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: (name) => headers[String(name).toLowerCase()] ?? null },
+    async json() { return {}; },
+    async text() { return ''; },
+  };
+}
+
+/** 只在 body 真的是 JSON 时才解析，二进制体（文件上传）原样保留。 */
+function tryParseJson(body) {
+  if (typeof body !== 'string') return null;
+  try {
+    return JSON.parse(body);
+  } catch {
+    return null;
+  }
+}
+
 function makeAbortError() {
   const error = new Error('This operation was aborted');
   error.name = 'AbortError';
@@ -116,7 +148,9 @@ function createServer(routes) {
       path,
       method: init.method,
       headers: { ...(init.headers ?? {}) },
-      body: init.body ? JSON.parse(init.body) : null,
+      // 上传是二进制体，JSON.parse 会炸；保留原字节供断言，并只在能解析时给出 body。
+      rawBody: init.body ?? null,
+      body: init.body && !(init.body instanceof Uint8Array) ? tryParseJson(init.body) : null,
       hasSignal: Boolean(init.signal),
       aborted: false,
       at: Date.now(),
@@ -515,6 +549,164 @@ await test('3c. 没有 context_token 时请求体省略该字段（不写空串�
     assert.equal(result.contextTokenUsed, false);
     const msg = server.callsTo(ROUTE_SEND)[0].body.msg;
     assert.ok(!Object.hasOwn(msg, 'context_token'), '未知对话能力时应省略 context_token 字段');
+  } finally {
+    await shutdown(transport);
+  }
+});
+
+// ===========================================================================
+// 3c. sendFile：getuploadurl → CDN PUT（AES-128-ECB）→ sendmessage(type=4)
+// ===========================================================================
+
+const ROUTE_UPLOAD_URL = '/ilink/bot/getuploadurl';
+const CDN_HOST = '/cdn-upload';
+
+await test('3e. sendFile 三步走：getuploadurl → 加密POST到CDN → sendmessage item type=4', async () => {
+  const dir = await caseDir();
+  const statePath = join(dir, 'state.json');
+  const filePath = join(dir, '报告 final.pdf');
+  // 故意不是 16 字节的整数倍：会触发 PKCS#7 填充，顺带验证密文长度 = 填充后长度。
+  const plain = Buffer.from('DeepSeek Harness 文件正文 hello world', 'utf8');
+  await writeFile(filePath, plain);
+
+  const server = createServer({
+    ...lifecycleRoutes(),
+    [ROUTE_UPDATES]: scriptedUpdates([
+      { ret: 0, msgs: [inbound({ id: '7514359851920000001', contextToken: 'CT-FILE', seq: 1 })], get_updates_buf: 'buf' },
+    ]),
+    [ROUTE_UPLOAD_URL]: () => jsonResponse({
+      ret: 0,
+      upload_param: 'ENC-QUERY-PARAM',
+      // 真实响应里 URL 还带 taskid，客户端自己拼是拼不出来的 —— 所以必须原样使用。
+      upload_full_url: `https://novac2c.cdn.weixin.qq.com${CDN_HOST}?encrypted_query_param=ENC-QUERY-PARAM&filekey=FK&taskid=TASK-1`,
+    }),
+    // CDN 把真正的下载参数放在响应头 x-encrypted-param 里。
+    [CDN_HOST]: () => headerResponse(200, { 'x-encrypted-param': 'DOWNLOAD-PARAM-FROM-HEADER' }),
+    [ROUTE_SEND]: () => jsonResponse({ ret: 0 }),
+  });
+
+  const transport = createWeixinTransport(baseOptions(statePath, server));
+  try {
+    await transport.start(() => {});
+    await waitFor(() => transport.status().connected === true, { label: '首次轮询完成' });
+
+    const result = await transport.sendFile(OWNER, filePath);
+    assert.equal(result.ok, true, `sendFile 应成功，实际 ${JSON.stringify(result)}`);
+    assert.equal(result.fileName, '报告 final.pdf', '文件名要取 basename');
+    assert.equal(result.fileSize, plain.length);
+    assert.equal(result.contextTokenUsed, true);
+    assert.match(result.messageId, /^dsh-weixin-[0-9a-f-]{36}$/);
+
+    // --- 第 1 步：getuploadurl 的请求体（明文/密文两组字段都要对）---------
+    const urlCall = server.callsTo(ROUTE_UPLOAD_URL)[0];
+    assert.equal(urlCall.method, 'POST');
+    assert.equal(urlCall.body.media_type, 3, '文件的上传槽位是 3（不是 item 的 4）');
+    assert.equal(urlCall.body.to_user_id, OWNER);
+    assert.equal(urlCall.body.rawsize, plain.length, 'rawsize 是明文大小');
+    assert.equal(
+      urlCall.body.rawfilemd5,
+      createHash('md5').update(plain).digest('hex'),
+      'rawfilemd5 是明文 MD5',
+    );
+    assert.equal(urlCall.body.no_need_thumb, true, '文件没有缩略图，必须显式声明');
+    // filekey 是客户端现生成的随机 16 字节 hex，**不是**文件名。
+    assert.match(urlCall.body.filekey, /^[0-9a-f]{32}$/, 'filekey 是随机 16 字节 hex');
+    assert.notEqual(urlCall.body.filekey, '报告 final.pdf', 'filekey 不是文件名');
+    // 官方 upload.ts 用 `aeskey.toString("hex")`：这里是 **hex**，不是 base64。
+    assert.match(urlCall.body.aeskey, /^[0-9a-f]{32}$/, 'getuploadurl 的 aeskey 是 hex 字符串');
+    const aesKey = Buffer.from(urlCall.body.aeskey, 'hex');
+    assert.equal(aesKey.length, 16, 'aeskey 是 128 位密钥');
+    const expectedCipherLength = Math.ceil((plain.length + 1) / 16) * 16;
+    assert.equal(urlCall.body.filesize, expectedCipherLength, 'filesize 是填充后的密文长度');
+
+    // --- 第 2 步：CDN **POST** 的就是那段密文 ------------------------------
+    const putCall = server.callsTo(CDN_HOST)[0];
+    assert.equal(putCall.method, 'POST', '官方 cdn-upload.ts 用的是 POST，不是 PUT');
+    // upload_full_url 必须原样使用：里面带服务端签发的 taskid，自己拼不出来。
+    assert.match(putCall.url, /taskid=TASK-1/, 'upload_full_url 必须原样使用（含服务端 taskid）');
+    assert.match(putCall.url, /encrypted_query_param=ENC-QUERY-PARAM/);
+    assert.ok(putCall.rawBody instanceof Uint8Array, '上传体必须是二进制');
+    assert.equal(putCall.rawBody.length, expectedCipherLength);
+    assert.equal(putCall.headers.Authorization, undefined, 'CDN 是预签名地址，不该带 Bearer');
+    assert.equal(putCall.headers.AuthorizationType, undefined);
+    // 用拿到的 aeskey 解回来，必须逐字节等于原文件。
+    const decipher = createDecipheriv('aes-128-ecb', aesKey, null);
+    const decrypted = Buffer.concat([decipher.update(Buffer.from(putCall.rawBody)), decipher.final()]);
+    assert.deepEqual(decrypted, plain, '密文必须能被 aeskey 解回原文');
+
+    // --- 第 3 步：sendmessage 里是 type=4 + file_item ----------------------
+    const sendCall = server.callsTo(ROUTE_SEND)[0];
+    const msg = sendCall.body.msg;
+    assert.equal(msg.from_user_id, '');
+    assert.equal(msg.to_user_id, OWNER);
+    assert.equal(msg.message_type, 2);
+    assert.equal(msg.message_state, 2);
+    assert.equal(msg.context_token, 'CT-FILE', '必须带 context_token，否则平台静默丢弃');
+    assert.equal(msg.item_list.length, 1);
+    const item = msg.item_list[0];
+    assert.equal(item.type, 4, '文件消息的 item type 是 4');
+    assert.equal(item.file_item.file_name, '报告 final.pdf');
+    // 官方 FileItem: { media, file_name, len }。len 是**明文字节数的字符串**。
+    assert.equal(item.file_item.len, String(plain.length), 'len 是明文字节数的字符串');
+    assert.equal(typeof item.file_item.len, 'string', 'len 必须是字符串，不是数字');
+    assert.equal(item.file_item.md5, undefined, '官方 FileItem 没有 md5 字段');
+    assert.equal(item.file_item.media_id, undefined, 'media_id 是 hub 扩展，不是官方协议');
+    // media 引用来自 CDN 响应头 x-encrypted-param，不是 body 的 upload_param。
+    assert.equal(item.file_item.media.encrypt_query_param, 'DOWNLOAD-PARAM-FROM-HEADER');
+    assert.equal(item.file_item.media.encrypt_type, 1);
+    // aes_key 是 base64(hex 字符串) —— 与 getuploadurl 的纯 hex 不同。
+    const decodedKey = Buffer.from(item.file_item.media.aes_key, 'base64').toString('utf8');
+    assert.match(decodedKey, /^[0-9a-f]{32}$/, 'media.aes_key 是 base64 过的 hex 串');
+    assert.equal(decodedKey, urlCall.body.aeskey, '两处编码不同，但必须是同一把密钥');
+    assert.equal(item.text_item, undefined, '文件消息不该附带空 text_item');
+  } finally {
+    await shutdown(transport);
+  }
+});
+
+await test('3f. sendFile 失败路径：文件不存在 / 过大 / 空文件 / 无 context_token', async () => {
+  const dir = await caseDir();
+  const statePath = join(dir, 'state.json');
+  const server = createServer({
+    ...lifecycleRoutes(),
+    // 不给任何 context_token：模拟「对方还没发过消息」
+    [ROUTE_UPDATES]: scriptedUpdates([{ ret: 0, msgs: [], get_updates_buf: 'buf' }]),
+    [ROUTE_UPLOAD_URL]: () => jsonResponse({ ret: 0, upload_param: 'P', upload_full_url: `https://novac2c.cdn.weixin.qq.com${CDN_HOST}` }),
+    // CDN 把真正的下载参数放在响应头 x-encrypted-param 里。
+    [CDN_HOST]: () => headerResponse(200, { 'x-encrypted-param': 'DOWNLOAD-PARAM-FROM-HEADER' }),
+    [ROUTE_SEND]: () => jsonResponse({ ret: 0 }),
+  });
+
+  const transport = createWeixinTransport(baseOptions(statePath, server));
+  try {
+    await transport.start(() => {});
+    await waitFor(() => transport.status().connected === true, { label: '首次轮询完成' });
+
+    const missing = await transport.sendFile(OWNER, join(dir, 'nope.pdf'));
+    assert.equal(missing.ok, false);
+    assert.equal(missing.code, 'ENOENT', '不存在的文件要如实报 ENOENT');
+
+    const emptyPath = join(dir, 'empty.txt');
+    await writeFile(emptyPath, '');
+    const empty = await transport.sendFile(OWNER, emptyPath);
+    assert.equal(empty.ok, false);
+    assert.equal(empty.code, 'empty-file');
+
+    const dirAsFile = await transport.sendFile(OWNER, dir);
+    assert.equal(dirAsFile.ok, false);
+    assert.equal(dirAsFile.code, 'not-a-file');
+
+    const badArgs = await transport.sendFile(OWNER, '');
+    assert.equal(badArgs.ok, false);
+    assert.equal(badArgs.code, 'invalid-argument');
+
+    // 走到最后一步才缺 context_token：此时上传已经发生，但没有可投递的会话。
+    const realPath = join(dir, 'ok.txt');
+    await writeFile(realPath, 'x');
+    const noToken = await transport.sendFile(OWNER, realPath);
+    assert.equal(noToken.ok, false);
+    assert.equal(noToken.code, 'no-context-token', '没有 context_token 就不能假装成功');
+    assert.equal(server.callsTo(ROUTE_SEND).length, 0, '没有 context_token 不应真的去发消息');
   } finally {
     await shutdown(transport);
   }

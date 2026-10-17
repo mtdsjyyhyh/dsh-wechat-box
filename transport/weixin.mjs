@@ -109,10 +109,10 @@
  *   }
  */
 
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { createCipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 // ---------------------------------------------------------------------------
 // 协议常量（全部来自 weixin-api.mjs，行号见注释）
@@ -161,6 +161,24 @@ const MESSAGE_ID_MAX_FUTURE_MS = 24 * 60 * 60 * 1_000;
 
 /** 平台判死的 provider code：-14 = 登录凭据失效（weixin-runtime.mjs:266）。 */
 const FATAL_PROVIDER_CODES = new Set(['-14']);
+
+/**
+ * 微信媒体 CDN 基址（官方 openclaw-weixin src/cdn/cdn-url.ts 的 cdnBaseUrl）。
+ * 只有服务端没给 upload_full_url 时才用它自己拼 /upload?…。
+ */
+const WEIXIN_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c';
+
+/**
+ * getuploadurl 的 media_type。与 item_list 的 type 是**两套编号**，不要混用：
+ * 上传槽位 1=图片 2=视频 3=文件 4=语音；消息 item 2=图片 3=语音 4=文件 5=视频。
+ */
+const UPLOAD_MEDIA_TYPE_FILE = 3;
+
+/**
+ * 单文件上限。整个文件要读进内存再加密上传，所以必须有上限；
+ * 这里取 30MB——足够发论文/表格/图片，又不至于让一次误发把宿主内存吃光。
+ */
+const MAX_FILE_BYTES = 30 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // 错误类型
@@ -276,6 +294,18 @@ function baseInfo(botAgent) {
     channel_version: WEIXIN_PROTOCOL_VERSION,
     ...(botAgent ? { bot_agent: botAgent } : {}),
   };
+}
+
+/**
+ * AES-128-ECB + PKCS#7，iLink 的 CDN 上传就认这一种。
+ *
+ * ECB 在现代密码学里是反面教材（相同明文块出相同密文块），但这里没有选择：
+ * 平台按 ECB 解密，换成 GCM/CBC 会直接解不开。密钥每次上传现生成、只作用于
+ * 一个文件，所以它的弱点不会跨消息累积。
+ */
+function encryptEcb(plain, key) {
+  const cipher = createCipheriv('aes-128-ecb', key, null);
+  return Buffer.concat([cipher.update(plain), cipher.final()]);
 }
 
 /** 首个非零的 ret/errcode 即为拒绝码（weixin-api.mjs:101-109）。 */
@@ -1336,6 +1366,262 @@ export function createWeixinTransport(options = {}) {
         runtime.lastErrorInfo = null;
       }
       return { ok: true, messageId: clientId, contextTokenUsed: Boolean(contextToken), response };
+    },
+
+    /**
+     * 发送一个文件。**永不抛异常**，返回形状与 sendText 一致。
+     *
+     * 协议以官方 openclaw-weixin v2.4.6 源码为准
+     * （src/cdn/upload.ts、src/cdn/cdn-upload.ts、src/messaging/send.ts）。
+     * 三步，不是一条消息：
+     *   1. POST ilink/bot/getuploadurl —— 拿上传地址。请求同时带**明文**
+     *      rawsize/rawfilemd5 与**密文** filesize，`aeskey` 是密钥的 **hex** 串，
+     *      文件无缩略图要显式 `no_need_thumb: true`，`filekey` 是客户端现生成的
+     *      随机 16 字节 hex（不是文件名）。
+     *   2. POST 密文到 CDN（AES-128-ECB + PKCS#7）。注意是 **POST 不是 PUT**；
+     *      真正的下载参数在响应头 `x-encrypted-param`，**不在 body**。
+     *   3. POST ilink/bot/sendmessage —— `type: 4` + `file_item`
+     *      `{ media: {encrypt_query_param, aes_key, encrypt_type:1}, file_name, len }`。
+     *      这里 `media.aes_key` 是 **base64(hex 字符串)**（与第 1 步的纯 hex 不同），
+     *      `len` 是**明文字节数的字符串**。
+     */
+    async sendFile(userId, filePath) {
+      const recipient = nonEmptyString(userId);
+      if (!recipient) {
+        return { ok: false, code: 'invalid-argument', message: 'sendFile(userId, filePath)：userId 必须是非空字符串。' };
+      }
+      const target = nonEmptyString(filePath);
+      if (!target) {
+        return { ok: false, code: 'invalid-argument', message: 'sendFile(userId, filePath)：filePath 必须是非空字符串。' };
+      }
+
+      let plain;
+      let fileStat;
+      try {
+        fileStat = await stat(target);
+        if (!fileStat.isFile()) {
+          return { ok: false, code: 'not-a-file', message: `不是一个文件：${target}` };
+        }
+        // 上限来自协议侧而不是我们的偏好：整段文件要读进内存再加密上传，
+        // 无上限会让一次误发大文件把宿主内存吃光。
+        if (fileStat.size > MAX_FILE_BYTES) {
+          return {
+            ok: false,
+            code: 'file-too-large',
+            message: `文件 ${fileStat.size} 字节，超过上限 ${MAX_FILE_BYTES} 字节（${Math.floor(MAX_FILE_BYTES / 1024 / 1024)}MB）。`,
+          };
+        }
+        if (fileStat.size === 0) {
+          return { ok: false, code: 'empty-file', message: `文件是空的：${target}` };
+        }
+        plain = await readFile(target);
+      } catch (error) {
+        return { ok: false, code: error?.code ?? 'read-failed', message: `读取文件失败：${error?.message ?? error}` };
+      }
+
+      await state.load();
+      let tokenValue;
+      try {
+        const resolved = await token();
+        if (!resolved) throw new WeixinTransportError('token-missing', '未找到微信机器人凭据。');
+        tokenValue = resolved.token;
+        state.bindCredential(tokenValue);
+      } catch (error) {
+        return { ok: false, code: error?.code ?? 'token-missing', message: error?.message ?? String(error) };
+      }
+
+      const fileName = basename(target);
+      const plainMD5 = createHash('md5').update(plain).digest('hex');
+      // filekey 由客户端现生成（16 字节 hex），**不是**文件名：它在上传 URL 里当
+      // 参数用，文件名走 file_item.file_name。用文件名会撞上 URL 编码和重名。
+      const filekey = randomBytes(16).toString('hex');
+      const aesKey = randomBytes(16);
+      let cipher;
+      try {
+        cipher = encryptEcb(plain, aesKey);
+      } catch (error) {
+        return { ok: false, code: 'encrypt-failed', message: `加密文件失败：${error?.message ?? error}` };
+      }
+
+      // --- 1. 预签名上传地址 ---------------------------------------------
+      // getuploadurl 的 aeskey 是**16 字节密钥的 hex 字符串**（官方 upload.ts:
+      // `aeskey.toString("hex")`）。传 base64 会被平台判为非法参数（ret=-1）。
+      // 文件没有缩略图，`no_need_thumb: true` 必须显式给出。
+      let uploadParam = null;
+      let uploadFullUrl = null;
+      const uploadRequestBody = {
+        filekey,
+        media_type: UPLOAD_MEDIA_TYPE_FILE,
+        to_user_id: recipient,
+        rawsize: fileStat.size,
+        rawfilemd5: plainMD5,
+        filesize: cipher.length,
+        no_need_thumb: true,
+        aeskey: aesKey.toString('hex'),
+        base_info: baseInfo(settings.botAgent),
+      };
+      try {
+        const response = await requestJson(fetchImpl, {
+          method: 'POST',
+          baseUrl: normalizedBaseUrl,
+          endpoint: 'ilink/bot/getuploadurl',
+          body: uploadRequestBody,
+          token: tokenValue,
+          timeoutMs: settings.requestTimeoutMs,
+          signal: controller?.signal,
+          allowUntrustedBaseUrl: settings.allowUntrustedBaseUrl,
+        });
+        const providerCode = rejectedProviderCode(response);
+        if (providerCode) {
+          // 平台只说 ret，不说为什么。把 errmsg 带出来——排查 getuploadurl
+          // 参数错误时，这是唯一能区分「字段名不对」和「值不合法」的线索。
+          const providerMessage = nonEmptyString(response?.errmsg) ?? null;
+          recordError(new WeixinTransportError('upload-rejected', '微信服务拒绝了上传请求。', { providerCode }), 'send');
+          return {
+            ok: false,
+            code: 'upload-rejected',
+            message: providerMessage
+              ? `微信服务拒绝了上传请求：${providerMessage}`
+              : '微信服务拒绝了上传请求（平台未给出 errmsg）。',
+            providerCode,
+            providerMessage,
+            // 请求体里没有任何密钥（aeskey 是本次现生成、只对这一个文件有效），
+            // 回显它能让调用方直接看出是哪个字段被拒。
+            sentFields: Object.keys(requestBody),
+          };
+        }
+        uploadFullUrl = nonEmptyString(response?.upload_full_url);
+        uploadParam = nonEmptyString(response?.upload_param);
+      } catch (error) {
+        const code = error?.name === 'AbortError' ? 'aborted' : (error?.code ?? 'unknown');
+        recordError(error, 'send');
+        return { ok: false, code, message: error?.message ?? String(error) };
+      }
+      // --- 2. POST 密文到 CDN --------------------------------------------
+      // 官方 cdn-upload.ts：**POST**（不是 PUT），且只带 Content-Type。
+      // 服务端优先给 upload_full_url；没有才自己拼 /c2c/upload?encrypted_query_param=&filekey=。
+      // 关键：真正的**下载**参数在响应头 `x-encrypted-param` 里，不在 body。
+      // 拿 body 里的 upload_param 当下载参数发出去，微信那头就打不开文件。
+      const uploadUrl = uploadFullUrl
+        ?? (uploadParam
+          ? `${WEIXIN_CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`
+          : null);
+      if (!uploadUrl) {
+        recordError(new WeixinTransportError('upload-no-url', 'getuploadurl 没有返回上传地址。'), 'send');
+        return { ok: false, code: 'upload-no-url', message: 'getuploadurl 没有返回上传地址。' };
+      }
+
+      let downloadParam;
+      try {
+        const uploadResponse = await fetchImpl(uploadUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: cipher,
+          signal: controller?.signal,
+        });
+        if (!uploadResponse?.ok) {
+          const detail = uploadResponse?.headers?.get?.('x-error-message') ?? '';
+          const error = new WeixinTransportError(
+            'upload-http-error',
+            `上传文件失败（HTTP ${uploadResponse?.status ?? '?'}${detail ? `：${detail}` : ''}）`,
+            { status: uploadResponse?.status },
+          );
+          recordError(error, 'send');
+          return { ok: false, code: 'upload-http-error', message: error.message, status: uploadResponse?.status };
+        }
+        downloadParam = nonEmptyString(uploadResponse?.headers?.get?.('x-encrypted-param'));
+        if (!downloadParam) {
+          const error = new WeixinTransportError(
+            'upload-no-param',
+            'CDN 上传成功但响应头缺少 x-encrypted-param，无法构造文件引用。',
+          );
+          recordError(error, 'send');
+          return { ok: false, code: 'upload-no-param', message: error.message };
+        }
+      } catch (error) {
+        const code = error?.name === 'AbortError' ? 'aborted' : (error?.code ?? 'unknown');
+        recordError(error, 'send');
+        return { ok: false, code, message: error?.message ?? String(error) };
+      }
+
+      // --- 3. 发消息 ------------------------------------------------------
+      const contextToken = state.contextTokenFor(recipient);
+      // 没有 context_token 的一条会被平台接受再静默丢弃（与 sendText 同一个坑）。
+      if (!contextToken) {
+        return {
+          ok: false,
+          code: 'no-context-token',
+          message: '微信会话尚未建立：需要对方先在微信里发一条消息（机器人无法主动发起会话）。',
+        };
+      }
+      const clientId = `dsh-weixin-${randomUUID()}`;
+      const body = {
+        msg: {
+          from_user_id: '',
+          to_user_id: recipient,
+          client_id: clientId,
+          message_type: 2,
+          message_state: 2,
+          // 官方 FileItem：{ media: CDNMedia, file_name, len }。
+          // `media.aes_key` 是 **base64(hex 字符串)**（官方 send.ts:
+          // `Buffer.from(uploaded.aeskey).toString("base64")`，而 aeskey 本身是 hex）——
+          // 与 getuploadurl 里的纯 hex 不同，别照抄。
+          // `len` 是**明文字节数的字符串**，不是数字字段 file_size。
+          item_list: [{
+            type: 4,
+            file_item: {
+              media: {
+                encrypt_query_param: downloadParam,
+                aes_key: Buffer.from(aesKey.toString('hex'), 'utf8').toString('base64'),
+                encrypt_type: 1,
+              },
+              file_name: fileName,
+              len: String(fileStat.size),
+            },
+          }],
+          context_token: contextToken,
+        },
+        base_info: baseInfo(settings.botAgent),
+      };
+
+      let response;
+      try {
+        response = await requestJson(fetchImpl, {
+          method: 'POST',
+          baseUrl: normalizedBaseUrl,
+          endpoint: 'ilink/bot/sendmessage',
+          body,
+          token: tokenValue,
+          timeoutMs: settings.requestTimeoutMs,
+          signal: controller?.signal,
+          allowUntrustedBaseUrl: settings.allowUntrustedBaseUrl,
+        });
+      } catch (error) {
+        const code = error?.name === 'AbortError' ? 'aborted' : (error?.code ?? 'unknown');
+        recordError(error, 'send');
+        return { ok: false, code, message: error?.message ?? String(error) };
+      }
+
+      const providerCode = rejectedProviderCode(response);
+      if (providerCode) {
+        const error = new WeixinTransportError('send-rejected', '微信服务拒绝了这条文件消息。', { providerCode });
+        recordError(error, 'send');
+        return { ok: false, code: 'send-rejected', message: error.message, providerCode };
+      }
+
+      runtime.lastOutboundAt = Date.now();
+      if (runtime.lastErrorInfo?.phase === 'send') {
+        runtime.lastError = null;
+        runtime.lastErrorInfo = null;
+      }
+      return {
+        ok: true,
+        messageId: clientId,
+        contextTokenUsed: true,
+        fileName,
+        fileSize: fileStat.size,
+        response,
+      };
     },
 
     /**

@@ -207,6 +207,23 @@ DeepSeek Harness（DSH）的**微信桥接插件**：给每个对话一个开关
 `POST /api/dsh-wechat-box/push`，body `{"text":"…"}`（可带 `sessionId`、`userId`）。
 走**本插件自己的 transport**，不另起第二个长轮询消费者。
 
+### 10. 发文件
+
+`POST /api/dsh-wechat-box/file`，body `{"path":"D:\\out\\报告.pdf"}`（可带 `sessionId`、`userId`）。
+
+发文件不是一条消息就完事，iLink 上是三步（`transport/weixin.mjs` 的 `sendFile`）：
+
+1. `POST ilink/bot/getuploadurl` —— 拿到 CDN 预签名地址。请求要同时带**明文**的
+   `rawsize` / `rawfilemd5` 和**密文**的 `filesize` / `aeskey`，服务端靠它们分配槽位并校验。
+2. `PUT` 密文到该地址（AES-128-ECB + PKCS#7，密钥每次现生成；CDN 是预签名地址，**不带** iLink 鉴权头）。
+3. `POST ilink/bot/sendmessage` —— `item_list` 放 `{"type":4,"file_item":{media_id,file_name,file_size,md5}}`。
+
+注意两套编号别混用：**上传槽位** `media_type` 1=图片 2=视频 3=文件 4=语音；
+**消息 item** 的 `type` 2=图片 3=语音 4=文件 5=视频。
+
+单文件上限 30MB（整段要读进内存再加密）。没有 `context_token` 时**直接拒绝**而不是假装成功——
+那种发送会被平台接受然后静默丢弃。路径由调用方给出，插件不猜。
+
 ---
 
 ## 安装（一键）
@@ -380,6 +397,7 @@ state 路由里所有真实标识符都做过掩码（`1e72c8….bot`）。
 | `POST`/`GET` | `/api/dsh-wechat-box/beacon` | 客户端半边的三级信标（`eval` / `factory` / `registered` / `error`） |
 | `POST` | `/api/dsh-wechat-box/enabled` | 运行时开关，body `{"enabled":true|false}`，会持久化 |
 | `POST` | `/api/dsh-wechat-box/push` | 主动推一条，body `{"text":"…"}`（可选 `sessionId` / `userId`） |
+| `POST` | `/api/dsh-wechat-box/file` | 发一个磁盘上的文件，body `{"path":"…"}`（可选 `sessionId` / `userId`） |
 | `POST` | `/api/dsh-wechat-box/login/begin` | 拉二维码，返回 `qrImage`（内联 SVG data URL）与 `expiresAtMs` |
 | `POST` | `/api/dsh-wechat-box/login/poll` | 轮询扫码状态，可带 `verifyCode` |
 
